@@ -1,0 +1,268 @@
+# Builds the UniXNU kernel for the QEMU AArch64 virt machine on a macOS runner.
+#
+# Why macOS and not the Windows host this was ported on: the kernel step needs Xcode's `mig`,
+# `migcom`, `iig` and `dapple`. `osfmk/mach/Makefile` generates every `*_server.h` and `*_user.h`
+# from 55 `.defs` files at build time and the tree ships no pre-generated output, so there is no
+# substitute. `makedefs/MakeInc.cmd:224` resolves mig through `xcrun -find mig`, which is empty on
+# a host without Xcode, and every MIG rule then collapses.
+#
+# Everything the kernel does not need already runs on Windows: IPSW member extraction and pin
+# verification, kernelcache LZFSE decode, the 53 XNU patches, the device tree, boot.img and the
+# UEFI payload. This job therefore produces one thing — the kernel and the archives it links — and
+# hands it back.
+#
+# Both upstream repositories are cloned rather than assumed, so this runs from an empty repository
+# with no forks and no secrets.
+
+name: build-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: Kernel defconfig to build
+        required: false
+        default: qemu_defconfig
+        type: choice
+        options:
+          - qemu_defconfig
+          # Needs the archives scripts/build-os-root.py makes, which this job does not build yet.
+          - qemu_root_defconfig
+  push:
+    paths:
+      - '.github/workflows/build-kernel.yml'
+
+concurrency:
+  group: build-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEFCONFIG: ${{ github.event.inputs.defconfig || 'qemu_defconfig' }}
+  # The IPSW build the board pins; used as the cache key for the staged members.
+  IPSW_BUILD: '21H461'
+
+jobs:
+  kernel:
+    # arm64 macOS: the target is arm64, and the runner image carries a full Xcode, which is the
+    # only place mig exists.
+    runs-on: macos-14
+    timeout-minutes: 350
+
+    steps:
+      - name: Report the runner and the Xcode tools
+        # Deliberately without `set -e`: the whole diagnostic prints, and a missing Xcode tool is
+        # visible here instead of surfacing as a confusing make error twenty minutes later.
+        run: |
+          set -uo pipefail
+          sw_vers
+          uname -m
+          sysctl -n hw.ncpu
+          sysctl -n hw.memsize
+          df -h /
+          xcodebuild -version || true
+          for t in clang mig migcom iig dapple libtool strip otool nm lipo; do
+            printf '%-10s %s\n' "$t" "$(xcrun --find "$t" 2>/dev/null || echo MISSING)"
+          done
+
+      - name: Free disk space
+        # The full IPSW is 6.8 GiB and the kernel build tree is several more. The runner image
+        # reserves much of its disk for simulator runtimes this job never uses. Every removal is
+        # best-effort: the exact platform paths differ between runner images.
+        run: |
+          set -uo pipefail
+          sudo rm -rf \
+            /Library/Developer/CoreSimulator/Caches/* \
+            /Library/Developer/CoreSimulator/Profiles/Runtimes/* \
+            "$HOME/Library/Developer/Xcode/DerivedData"/* \
+            /Applications/Xcode*.app/Contents/Developer/Platforms/AppleTVOS.platform \
+            /Applications/Xcode*.app/Contents/Developer/Platforms/WatchOS.platform \
+            /Applications/Xcode*.app/Contents/Developer/Platforms/AppleVisionOS.platform \
+            || true
+          df -h /
+
+      - name: Check out UniXNU
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          # No explicit ref: the default branch. `unixnu fetch` brings the module submodules, so
+          # this checkout does not recurse into them itself.
+          path: UniXNU
+          fetch-depth: 1
+
+      - name: Check out the QEMU device repository
+        uses: actions/checkout@v4
+        with:
+          repository: xVanTuring/UniXNU-qemu
+          path: UniXNU-qemu
+          fetch-depth: 1
+
+      - name: Install host tools
+        # unifdef filters libdispatch's headers for the kernel (build-xnu-4k-baseline.sh:105);
+        # cmake and ninja build AvailabilityVersions' availability.pl.
+        run: |
+          set -euo pipefail
+          brew install unifdef cmake ninja
+          for t in unifdef cmake ninja; do
+            printf '%-8s %s\n' "$t" "$(command -v "$t")"
+          done
+
+      - name: Restore the staged IPSW members
+        id: ipsw-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: UniXNU/out/ipsw
+          key: ipsw-${{ env.IPSW_BUILD }}-${{ hashFiles('UniXNU-qemu/board.toml') }}
+
+      - name: Download the IPSW
+        if: steps.ipsw-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          URL=$(python3 - <<'PY'
+          import tomllib
+          with open('UniXNU-qemu/board.toml', 'rb') as f:
+              print(tomllib.load(f)['ipsw']['url'])
+          PY
+          )
+          echo "url: $URL"
+          curl --fail --location --retry 3 --retry-delay 5 \
+            --output "$RUNNER_TEMP/ipsw.ipsw" "$URL"
+          ls -l "$RUNNER_TEMP/ipsw.ipsw"
+
+      - name: Stage the kernel and trust-cache members
+        # UNIXNU_IPSW is the driver's documented input for a local archive (cli.py). Reading the
+        # local file avoids a second 6.8 GiB transfer through HTTP range requests.
+        env:
+          UNIXNU_IPSW: ${{ runner.temp }}/ipsw.ipsw
+        run: |
+          set -euo pipefail
+          cd UniXNU
+          ./unixnu defconfig "$DEFCONFIG" -D ../UniXNU-qemu
+          ./unixnu ipsw fetch -D ../UniXNU-qemu
+          du -sh out/ipsw/* 2>/dev/null || true
+          # The archive is not needed once its members are staged, and the runner disk cannot
+          # hold both it and the build tree.
+          rm -f "$UNIXNU_IPSW"
+          df -h /
+
+      - name: Save the staged IPSW members
+        if: steps.ipsw-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: UniXNU/out/ipsw
+          key: ipsw-${{ env.IPSW_BUILD }}-${{ hashFiles('UniXNU-qemu/board.toml') }}
+
+      - name: Build the kernel, first pass
+        working-directory: UniXNU
+        run: |
+          set -o pipefail
+          # On a new tree the PMGR bridge has no reference kernel to bind to, so this pass links a
+          # no-op in its place and says so (README, "Build and run").
+          ./unixnu build package kernel -D ../UniXNU-qemu 2>&1 | tee "$RUNNER_TEMP/kernel-pass1.log"
+
+      - name: Build the kernel, second pass
+        working-directory: UniXNU
+        run: |
+          set -o pipefail
+          ./unixnu build package kernel -D ../UniXNU-qemu 2>&1 | tee "$RUNNER_TEMP/kernel-pass2.log"
+
+      - name: Report the kernel
+        id: kernel
+        working-directory: UniXNU
+        run: |
+          set -euo pipefail
+          K=build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
+          if [ ! -f "$K" ]; then
+            echo "::error::the kernel was not produced at $K"
+            find build -name 'mach.*' -type f 2>/dev/null | head -20
+            exit 1
+          fi
+          ls -l "$K"
+          file "$K"
+          shasum -a 256 "$K" | tee kernel.sha256
+          # The unslid link address the board expects (ARM64_LINK_ADDR=0xfffffff007004000).
+          otool -l "$K" | grep -A4 'segname __TEXT' | head -8 || true
+          echo "kernel=$K" >> "$GITHUB_OUTPUT"
+
+      - name: Package the artefacts
+        working-directory: UniXNU
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/out"
+          mkdir -p "$OUT"
+          cp build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf "$OUT/"
+          # The external archives the kernel links: without them a relink means rebuilding every
+          # component from source.
+          for a in build/*/*.a; do
+            [ -f "$a" ] || continue
+            case "$a" in
+              *libcorecrypto*|*libpthread_kernel*|*libArmCpu*|*libArmDTPlatform*|*libNativeAES*|*libShengPlatformPower*|*libLinkStubs*|*libmockfs*) \
+                cp "$a" "$OUT/" ;;
+            esac
+          done
+          # The SDK the kernel compiled against; needed to relink against the same headers.
+          tar -C .cache -czf "$OUT/fakeroot.tar.gz" fakeroot
+          cp kernel.sha256 "$OUT/"
+          ls -lh "$OUT"
+
+      - name: Harvest the MIG output
+        if: always()
+        working-directory: UniXNU
+        run: |
+          set -uo pipefail
+          # mig is a pure function of .defs and flags, so its output for this XNU revision is
+          # worth keeping: with it in place, a host without Xcode can rebuild the kernel and make
+          # will not invoke mig at all. Collected even when the kernel step failed, because the
+          # generated sources exist long before the link does.
+          OBJ=out/qemu/tree/build/xnu/obj
+          if [ ! -d "$OBJ" ]; then
+            echo "no object tree; nothing to harvest"
+            exit 0
+          fi
+          STAGE=$(mktemp -d)
+          mkdir -p "$STAGE/files"
+          n=0
+          while IFS= read -r f; do
+            rel=${f#"$OBJ"/}
+            mkdir -p "$STAGE/files/$(dirname "$rel")"
+            cp "$f" "$STAGE/files/$rel"
+            n=$((n + 1))
+          done < <(find "$OBJ" -type f \( -name '*_server.c' -o -name '*_user.c' \
+            -o -name '*_server.h' -o -name '*_user.h' \) 2>/dev/null)
+          echo "collected $n mig-generated files"
+          {
+            echo "files=$n"
+            date -u +generated=%Y-%m-%dT%H:%M:%SZ
+            echo
+            ( cd "$STAGE/files" && find . -type f | sort )
+          } > "$STAGE/MANIFEST"
+          tar -C "$STAGE" -czf "$RUNNER_TEMP/mig-output.tar.gz" .
+          tar -tzf "$RUNNER_TEMP/mig-output.tar.gz" | head -20
+
+      - name: Upload the kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ env.DEFCONFIG }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+
+      - name: Upload the MIG output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Carrying this to a host without Xcode removes the macOS dependency for every later
+          # build; see ci/apply-mig-output.sh.
+          name: mig-output
+          path: ${{ runner.temp }}/mig-output.tar.gz
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload the build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ${{ runner.temp }}/kernel-pass1.log
+            ${{ runner.temp }}/kernel-pass2.log
+          retention-days: 14
+          if-no-files-found: warn
